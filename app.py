@@ -21,6 +21,7 @@ from indicators import (
 )
 from analyzer import NextDayPredictor
 from telegram_alerts import send_telegram_message, format_signal_message
+from data_fetcher import fetch_stock_data, fetch_vix, clear_cache
 
 # ==================== 頁面設定 ====================
 st.set_page_config(
@@ -143,38 +144,58 @@ with st.sidebar:
     st.text(f"UK:  {datetime.now(uk_tz).strftime('%H:%M:%S')}")
     st.text(f"NYC: {datetime.now(ny_tz).strftime('%H:%M:%S')}")
 
-# ==================== 數據載入 ====================
-@st.cache_data(ttl=60)
+# ==================== 數據載入 (韌性多源) ====================
+@st.cache_data(ttl=120, show_spinner=False)
 def load_data(sym, tf, per):
-    """載入股票數據"""
-    try:
-        ticker = yf.Ticker(sym)
-        df = ticker.history(period=per, interval=tf)
-        if df.empty:
-            return None, None
-        df.index = pd.to_datetime(df.index)
-        info = ticker.info
-        return df, info
-    except Exception as e:
-        st.error(f"數據載入失敗: {e}")
-        return None, None
+    """載入股票數據 - 多源備援"""
+    df, source, is_stale = fetch_stock_data(sym, per, tf, use_cache=True)
+    info = {}
+    return df, info, source, is_stale
 
-@st.cache_data(ttl=300)
-def load_vix():
-    """載入 VIX 數據"""
-    try:
-        vix = yf.Ticker("^VIX").history(period="5d", interval="1d")
-        return vix
-    except:
-        return None
+@st.cache_data(ttl=300, show_spinner=False)
+def load_vix_data():
+    """載入 VIX - 多源備援"""
+    df, source, is_stale = fetch_vix(use_cache=True)
+    return df, source, is_stale
 
 with st.spinner(f"📡 載入 {symbol} {timeframe} 數據..."):
-    df, info = load_data(symbol, timeframe, period)
-    vix_df = load_vix()
+    df, info, data_source, is_stale = load_data(symbol, timeframe, period)
+    vix_df, vix_source, vix_stale = load_vix_data()
 
+# 顯示數據源狀態
 if df is None or df.empty:
-    st.error("❌ 無法載入數據,請檢查網路或股票代號")
+    st.error("❌ 所有數據源均無法存取,請稍後再試")
+    with st.expander("🔧 疑難排解"):
+        st.markdown("""
+        **Streamlit Cloud 上的常見問題:**
+        - Yahoo Finance 對雲端共享 IP 有 rate limit
+        - 分鐘級數據 (1m/5m/15m/30m/1h) 僅 yfinance 支援,無備援
+        - 日線/週線則會自動切到 Stooq 備援
+
+        **建議:**
+        1. 嘗試切換到日線 (1d) 或週線 (1wk),這兩個有 Stooq 備援
+        2. 等 1-2 分鐘讓 rate limit 重置
+        3. 點下方按鈕清除快取重試
+        """)
+        if st.button("🗑️ 清除快取並重試"):
+            st.cache_data.clear()
+            clear_cache()
+            st.rerun()
     st.stop()
+
+# 數據源提示
+source_col1, source_col2 = st.columns([4, 1])
+with source_col1:
+    if is_stale:
+        st.warning(f"⚠️ 使用快取數據 (可能過時) - 來源: {data_source}")
+    elif data_source == 'Stooq (備援)':
+        st.info(f"ℹ️ 使用備援數據源: {data_source} (yfinance rate limited)")
+    elif 'yfinance' not in data_source.lower():
+        st.caption(f"📡 數據源: {data_source}")
+with source_col2:
+    if st.button("🔄 強制刷新"):
+        st.cache_data.clear()
+        st.rerun()
 
 # ==================== 計算技術指標 ====================
 df['EMA_fast'] = ema(df['Close'], ema_fast)
@@ -464,14 +485,13 @@ with pat_col3:
 st.divider()
 st.subheader("📊 多股即時監控")
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=180, show_spinner=False)
 def get_multi_stock_summary(symbols):
-    """獲取多股摘要"""
+    """獲取多股摘要 - 使用韌性數據源"""
     results = []
     for s in symbols:
         try:
-            t = yf.Ticker(s)
-            hist = t.history(period="5d", interval="1d")
+            hist, src, stale = fetch_stock_data(s, "5d", "1d", use_cache=True)
             if hist.empty or len(hist) < 2:
                 continue
             last = hist.iloc[-1]
@@ -485,7 +505,9 @@ def get_multi_stock_summary(symbols):
                 'RSI': rsi_val,
                 'Range %': (last['High']-last['Low'])/last['Close']*100
             })
-        except:
+            # 小延遲,避免同時發多請求
+            time.sleep(0.2)
+        except Exception:
             continue
     return pd.DataFrame(results)
 
@@ -521,14 +543,14 @@ if not multi_df.empty:
 st.divider()
 st.subheader("⏱️ 多時間框架確認")
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=180, show_spinner=False)
 def multi_timeframe_signals(sym):
-    """多時間框架信號"""
+    """多時間框架信號 - 使用韌性數據源"""
     tfs = [('15m', '5d'), ('1h', '60d'), ('1d', '1y'), ('1wk', '3y')]
     signals = []
     for tf, per in tfs:
         try:
-            d = yf.Ticker(sym).history(period=per, interval=tf)
+            d, src, stale = fetch_stock_data(sym, per, tf, use_cache=True)
             if len(d) < 50:
                 continue
             ema20 = ema(d['Close'], 20)
@@ -547,7 +569,8 @@ def multi_timeframe_signals(sym):
                 '位置': above_ema,
                 'RSI': f"{rsi_now:.1f}"
             })
-        except:
+            time.sleep(0.2)
+        except Exception:
             continue
     return pd.DataFrame(signals)
 
