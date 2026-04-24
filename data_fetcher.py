@@ -1,252 +1,305 @@
 """
-韌性數據獲取模組
-解決 Streamlit Cloud 上 Yahoo Finance rate limit 問題
+韌性數據獲取模組 v3
+===================
+問題根源: yfinance 新版要求 curl_cffi session,舊版 requests session 不再有效
+         Stooq 在 Streamlit Cloud 出口 IP 被封
 
-策略:
-1. yfinance (主) - 帶重試 + 指數退避
-2. Stooq (備援) - 免費、無 rate limit
-3. 磁碟快取 (diskcache) - 失敗時使用最後成功數據
-4. Session state 快取 - 同一 session 不重複請求
+解決策略 (4 層):
+1. yfinance + curl_cffi session (修復新版 Yahoo API 要求)
+2. Alpha Vantage API (免費 500次/天,無 IP 封鎖)
+3. Finnhub API (免費 60次/分鐘,無 IP 封鎖)
+4. 磁碟快取 (diskcache) - 所有源都掛時用舊數據
 """
+
 import time
 import random
+import os
+from datetime import datetime, timedelta
+
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
 import requests
-from io import StringIO
 import streamlit as st
-import os
 
-# 嘗試載入 diskcache(可選依賴)
+# ── 磁碟快取 ────────────────────────────────────────────────────────────────
 try:
     import diskcache as dc
-    CACHE_DIR = os.path.join(os.path.expanduser('~'), '.next_day_predictor_cache')
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    _disk_cache = dc.Cache(CACHE_DIR, size_limit=100 * 1024 * 1024)  # 100MB
-    DISK_CACHE_OK = True
+    _CACHE_DIR = os.path.join(os.path.expanduser("~"), ".ndp_cache")
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+    _disk = dc.Cache(_CACHE_DIR, size_limit=200 * 1024 * 1024)
+    _DISK_OK = True
 except Exception:
-    _disk_cache = {}
-    DISK_CACHE_OK = False
-
-# 輪換 User-Agent (降低被識別為 bot)
-USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0',
-]
+    _disk = {}
+    _DISK_OK = False
 
 
-def _cache_key(symbol: str, period: str, interval: str) -> str:
+def _disk_get(key):
+    try:
+        return _disk.get(key) if _DISK_OK else _disk.get(key)
+    except Exception:
+        return None
+
+
+def _disk_set(key, val, expire=86400 * 7):
+    try:
+        if _DISK_OK:
+            _disk.set(key, val, expire=expire)
+        else:
+            _disk[key] = (val, datetime.now())
+    except Exception:
+        pass
+
+
+def _cache_key(symbol, period, interval):
     return f"{symbol}__{period}__{interval}"
 
 
-def _save_to_cache(key: str, df: pd.DataFrame):
-    """儲存到磁碟快取"""
-    try:
-        if DISK_CACHE_OK:
-            _disk_cache.set(key, df, expire=86400 * 7)  # 7 天過期
-        else:
-            _disk_cache[key] = (df, datetime.now())
-    except Exception:
-        pass
+_PERIOD_DAYS = {
+    "5d": 5, "7d": 7, "1mo": 30, "3mo": 90, "60d": 60,
+    "6mo": 180, "1y": 365, "2y": 730, "3y": 1095,
+    "5y": 1825, "730d": 730, "max": 36500,
+}
 
 
-def _load_from_cache(key: str, max_age_hours: int = 24):
-    """從磁碟讀取快取"""
-    try:
-        if DISK_CACHE_OK:
-            return _disk_cache.get(key)
-        else:
-            if key in _disk_cache:
-                df, ts = _disk_cache[key]
-                if (datetime.now() - ts).total_seconds() < max_age_hours * 3600:
-                    return df
-    except Exception:
-        pass
-    return None
+def _period_to_dates(period):
+    days = _PERIOD_DAYS.get(period, 365)
+    end = datetime.now()
+    start = end - timedelta(days=days)
+    return start, end
 
 
-def _fetch_yfinance(symbol: str, period: str, interval: str,
-                    max_retries: int = 3) -> pd.DataFrame:
-    """
-    使用 yfinance 帶重試機制
-    遇到 rate limit 指數退避等待
-    """
+# ══════════════════════════════════════════════════════════════════════════════
+# 源 1: yfinance + curl_cffi
+# ══════════════════════════════════════════════════════════════════════════════
+def _fetch_yfinance(symbol, period, interval, retries=3):
     import yfinance as yf
 
-    last_err = None
-    for attempt in range(max_retries):
+    session = None
+    try:
+        from curl_cffi import requests as cffi_req
+        session = cffi_req.Session(impersonate="chrome")
+    except ImportError:
+        pass
+
+    last_exc = None
+    for attempt in range(retries):
+        if attempt:
+            time.sleep(2 ** attempt + random.uniform(0.3, 1.5))
         try:
-            # 隨機抖動,避免同步請求風暴
-            if attempt > 0:
-                wait = (2 ** attempt) + random.uniform(0.5, 2.0)
-                time.sleep(wait)
-
-            # 建立 custom session 帶 User-Agent
-            session = requests.Session()
-            session.headers.update({
-                'User-Agent': random.choice(USER_AGENTS),
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-            })
-
-            ticker = yf.Ticker(symbol, session=session)
-            df = ticker.history(period=period, interval=interval, timeout=15)
-
+            ticker = yf.Ticker(symbol, session=session) if session else yf.Ticker(symbol)
+            df = ticker.history(period=period, interval=interval, timeout=20)
             if df is not None and not df.empty:
                 df.index = pd.to_datetime(df.index)
                 return df
         except Exception as e:
-            last_err = e
-            err_str = str(e).lower()
-            # rate limit 或 429 錯誤才重試,其他錯誤快速失敗
-            if 'too many' in err_str or 'rate' in err_str or '429' in err_str:
-                continue
-            elif attempt == max_retries - 1:
-                raise
-    if last_err:
-        raise last_err
+            last_exc = e
+            msg = str(e).lower()
+            if not any(k in msg for k in ("429", "too many", "rate", "timeout",
+                                           "connection", "curl_cffi", "session")):
+                break
+    if last_exc:
+        raise last_exc
     return pd.DataFrame()
 
 
-def _fetch_stooq(symbol: str, period: str, interval: str) -> pd.DataFrame:
-    """
-    Stooq 備援數據源 (免費、無 rate limit)
-    僅支援日線和週線
-    """
-    # Stooq 僅支援日線/週線/月線,分鐘級跳過
-    if interval in ['1m', '5m', '15m', '30m', '1h']:
+# ══════════════════════════════════════════════════════════════════════════════
+# 源 2: Alpha Vantage
+# ══════════════════════════════════════════════════════════════════════════════
+def _fetch_alpha_vantage(symbol, period, interval):
+    key = st.secrets.get("ALPHA_VANTAGE_KEY", "")
+    if not key:
         return pd.DataFrame()
 
-    interval_map = {
-        '1d': 'd',
-        '1wk': 'w',
-        '1mo': 'm'
-    }
-    stq_interval = interval_map.get(interval, 'd')
-
-    # Stooq 美股代碼加 .us 後綴
-    stq_symbol = f"{symbol.lower()}.us"
-    url = f"https://stooq.com/q/d/l/?s={stq_symbol}&i={stq_interval}"
+    _intra = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "1h": "60min"}
+    _daily = {"1d": "TIME_SERIES_DAILY", "1wk": "TIME_SERIES_WEEKLY", "1mo": "TIME_SERIES_MONTHLY"}
+    base = "https://www.alphavantage.co/query"
 
     try:
-        headers = {'User-Agent': random.choice(USER_AGENTS)}
-        r = requests.get(url, headers=headers, timeout=15)
-        if r.status_code != 200 or 'No data' in r.text:
+        if interval in _intra:
+            params = {"function": "TIME_SERIES_INTRADAY", "symbol": symbol,
+                      "interval": _intra[interval], "outputsize": "full",
+                      "apikey": key, "datatype": "json"}
+            r = requests.get(base, params=params, timeout=20)
+            data = r.json()
+            ts_key = f"Time Series ({_intra[interval]})"
+            if ts_key not in data:
+                return pd.DataFrame()
+            raw = data[ts_key]
+        elif interval in _daily:
+            params = {"function": _daily[interval], "symbol": symbol,
+                      "outputsize": "full", "apikey": key, "datatype": "json"}
+            r = requests.get(base, params=params, timeout=20)
+            data = r.json()
+            ts_key = next((k for k in data if "Time Series" in k or
+                           "Weekly" in k or "Monthly" in k), None)
+            if not ts_key:
+                return pd.DataFrame()
+            raw = data[ts_key]
+        else:
             return pd.DataFrame()
 
-        df = pd.read_csv(StringIO(r.text))
-        if df.empty or 'Date' not in df.columns:
+        rows = []
+        for dt_str, v in raw.items():
+            rows.append({"Date": pd.to_datetime(dt_str),
+                         "Open": float(v.get("1. open", 0)),
+                         "High": float(v.get("2. high", 0)),
+                         "Low": float(v.get("3. low", 0)),
+                         "Close": float(v.get("4. close", 0)),
+                         "Volume": float(v.get("5. volume", 0))})
+        if not rows:
             return pd.DataFrame()
-
-        df['Date'] = pd.to_datetime(df['Date'])
-        df = df.set_index('Date').sort_index()
-
-        # 標準化欄位名 (Stooq 已經是 Open/High/Low/Close/Volume)
-        # 確認欄位存在
-        required = ['Open', 'High', 'Low', 'Close', 'Volume']
-        if not all(c in df.columns for c in required):
-            return pd.DataFrame()
-
-        # 根據 period 截取
-        period_days = {
-            '5d': 5, '1mo': 30, '3mo': 90, '6mo': 180,
-            '1y': 365, '2y': 730, '5y': 1825, '10y': 3650,
-            'max': 36500, '60d': 60, '7d': 7, '730d': 730
-        }
-        days = period_days.get(period, 365)
-        cutoff = datetime.now() - timedelta(days=days)
-        df = df[df.index >= cutoff]
-
-        return df[required]
+        df = pd.DataFrame(rows).set_index("Date").sort_index()
+        start, _ = _period_to_dates(period)
+        return df[df.index >= start]
     except Exception:
         return pd.DataFrame()
 
 
-def fetch_stock_data(symbol: str, period: str, interval: str,
-                      use_cache: bool = True) -> tuple:
-    """
-    主數據獲取函數 - 多源備援
-    回傳 (df, source_name, is_stale)
-    """
+# ══════════════════════════════════════════════════════════════════════════════
+# 源 3: Finnhub
+# ══════════════════════════════════════════════════════════════════════════════
+def _fetch_finnhub(symbol, period, interval):
+    key = st.secrets.get("FINNHUB_KEY", "")
+    if not key:
+        return pd.DataFrame()
+
+    _res = {"1m": "1", "5m": "5", "15m": "15", "30m": "30",
+            "1h": "60", "1d": "D", "1wk": "W", "1mo": "M"}
+    resolution = _res.get(interval)
+    if not resolution:
+        return pd.DataFrame()
+
+    start, end = _period_to_dates(period)
+    try:
+        r = requests.get("https://finnhub.io/api/v1/stock/candle",
+                         params={"symbol": symbol, "resolution": resolution,
+                                 "from": int(start.timestamp()),
+                                 "to": int(end.timestamp()), "token": key},
+                         timeout=20)
+        data = r.json()
+        if data.get("s") != "ok" or not data.get("t"):
+            return pd.DataFrame()
+        df = pd.DataFrame({"Open": data["o"], "High": data["h"],
+                           "Low": data["l"], "Close": data["c"],
+                           "Volume": data["v"]},
+                          index=pd.to_datetime(data["t"], unit="s"))
+        df.index.name = "Date"
+        return df.sort_index()
+    except Exception:
+        return pd.DataFrame()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 主函數
+# ══════════════════════════════════════════════════════════════════════════════
+def fetch_stock_data(symbol, period, interval, use_cache=True):
+    """回傳 (df, source_label, is_stale)"""
     key = _cache_key(symbol, period, interval)
 
-    # Step 1: 嘗試 yfinance (主源)
+    # 源 1: yfinance
     try:
-        df = _fetch_yfinance(symbol, period, interval, max_retries=3)
+        df = _fetch_yfinance(symbol, period, interval)
         if not df.empty:
-            _save_to_cache(key, df)
-            return df, 'yfinance', False
+            _disk_set(key, df)
+            return df, "yfinance ✅", False
     except Exception as e:
-        err_msg = str(e).lower()
-        if 'too many' in err_msg or 'rate' in err_msg or '429' in err_msg:
-            st.warning(f"⚠️ yfinance rate limit,嘗試備援源...")
-        else:
-            st.info(f"ℹ️ yfinance 失敗 ({str(e)[:50]}),嘗試備援源...")
+        st.info(f"ℹ️ yfinance 失敗 ({str(e)[:80]}),嘗試備援源...")
 
-    # Step 2: 嘗試 Stooq (備援,日/週線有效)
-    if interval in ['1d', '1wk', '1mo']:
-        df = _fetch_stooq(symbol, period, interval)
+    # 源 2: Alpha Vantage
+    if st.secrets.get("ALPHA_VANTAGE_KEY", ""):
+        df = _fetch_alpha_vantage(symbol, period, interval)
         if not df.empty:
-            _save_to_cache(key, df)
-            return df, 'Stooq (備援)', False
+            _disk_set(key, df)
+            return df, "Alpha Vantage 🔄", False
+        st.info("ℹ️ Alpha Vantage 無數據,嘗試 Finnhub...")
 
-    # Step 3: 回落到磁碟快取
+    # 源 3: Finnhub
+    if st.secrets.get("FINNHUB_KEY", ""):
+        df = _fetch_finnhub(symbol, period, interval)
+        if not df.empty:
+            _disk_set(key, df)
+            return df, "Finnhub 🔄", False
+        st.info("ℹ️ Finnhub 無數據,嘗試快取...")
+
+    # 源 4: 磁碟快取
     if use_cache:
-        cached = _load_from_cache(key, max_age_hours=48)
-        if cached is not None and not cached.empty:
-            return cached, 'Cache (快取,可能過時)', True
+        cached = _disk_get(key)
+        if cached is not None:
+            if isinstance(cached, tuple):
+                df_c, ts = cached
+                if (datetime.now() - ts).total_seconds() < 48 * 3600 and not df_c.empty:
+                    return df_c, "記憶體快取 ⚠️", True
+            elif not cached.empty:
+                return cached, "磁碟快取 ⚠️", True
 
-    # 全部失敗
-    return pd.DataFrame(), 'Failed', True
+    return pd.DataFrame(), "全部失敗 ❌", True
 
 
-def fetch_vix(use_cache: bool = True) -> tuple:
-    """獲取 VIX (多源備援)"""
-    key = "__VIX__daily"
-
-    # Try yfinance
+def fetch_vix(use_cache=True):
+    key = "__VIX__1d"
     try:
-        df = _fetch_yfinance("^VIX", "5d", "1d", max_retries=2)
+        df = _fetch_yfinance("^VIX", "5d", "1d", retries=2)
         if not df.empty:
-            _save_to_cache(key, df)
-            return df, 'yfinance', False
+            _disk_set(key, df)
+            return df, "yfinance", False
     except Exception:
         pass
-
-    # Try Stooq (VIX 在 Stooq 為 ^vix)
-    try:
-        url = "https://stooq.com/q/d/l/?s=^vix&i=d"
-        r = requests.get(url, headers={'User-Agent': random.choice(USER_AGENTS)},
-                          timeout=15)
-        if r.status_code == 200 and 'No data' not in r.text:
-            df = pd.read_csv(StringIO(r.text))
-            df['Date'] = pd.to_datetime(df['Date'])
-            df = df.set_index('Date').sort_index().tail(10)
-            if not df.empty:
-                _save_to_cache(key, df)
-                return df, 'Stooq', False
-    except Exception:
-        pass
-
-    # Cache fallback
     if use_cache:
-        cached = _load_from_cache(key, max_age_hours=48)
-        if cached is not None and not cached.empty:
-            return cached, 'Cache', True
+        cached = _disk_get(key)
+        if cached is not None and not isinstance(cached, tuple) and not cached.empty:
+            return cached, "快取", True
+    return pd.DataFrame(), "失敗", True
 
-    return pd.DataFrame(), 'Failed', True
+
+def fetch_multi_stock(symbols):
+    rows = []
+    for sym in symbols:
+        try:
+            df, src, stale = fetch_stock_data(sym, "5d", "1d", use_cache=True)
+            if df.empty or len(df) < 2:
+                continue
+            last, prev = df.iloc[-1], df.iloc[-2]
+            from indicators import rsi
+            rsi_val = rsi(df["Close"], 14).iloc[-1]
+            rows.append({"Symbol": sym, "Price": last["Close"],
+                         "Change %": (last["Close"] / prev["Close"] - 1) * 100,
+                         "Volume (M)": last["Volume"] / 1e6,
+                         "RSI": rsi_val,
+                         "Range %": (last["High"] - last["Low"]) / last["Close"] * 100,
+                         "Source": src})
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return pd.DataFrame(rows)
 
 
 def clear_cache():
-    """清除快取"""
     try:
-        if DISK_CACHE_OK:
-            _disk_cache.clear()
-        else:
-            _disk_cache.clear()
+        _disk.clear() if _DISK_OK else _disk.clear()
         return True
     except Exception:
         return False
+
+
+def show_api_status():
+    av = st.secrets.get("ALPHA_VANTAGE_KEY", "")
+    fh = st.secrets.get("FINNHUB_KEY", "")
+    st.markdown("**📡 備援 API 狀態**")
+    st.markdown(f"{'✅' if av else '❌'} Alpha Vantage {'(已設定)' if av else '(未設定)'}")
+    st.markdown(f"{'✅' if fh else '❌'} Finnhub {'(已設定)' if fh else '(未設定)'}")
+    if not av and not fh:
+        with st.expander("⚙️ 如何設定備援 API?"):
+            st.markdown("""
+**Alpha Vantage** — 免費 500次/天
+1. [alphavantage.co/support/#api-key](https://www.alphavantage.co/support/#api-key) 填 email 即得
+2. Streamlit Cloud → App → Settings → Secrets 加入:
+```toml
+ALPHA_VANTAGE_KEY = "你的KEY"
+```
+**Finnhub** — 免費 60次/分鐘
+1. [finnhub.io/register](https://finnhub.io/register) 免費註冊
+2. 同樣加入 Secrets:
+```toml
+FINNHUB_KEY = "你的KEY"
+```
+            """)
